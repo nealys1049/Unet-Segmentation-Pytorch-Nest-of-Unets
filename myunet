@@ -1,0 +1,1513 @@
+from __future__ import print_function, division
+
+import os
+import cv2
+import pdb
+import time
+import warnings
+import random
+import matplotlib
+matplotlib.use("Agg")
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm_notebook as tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau,CosineAnnealingWarmRestarts
+from sklearn.model_selection import StratifiedKFold
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader, Dataset, sampler
+from matplotlib import pyplot as plt
+from albumentations import (HorizontalFlip, ShiftScaleRotate, Normalize, Resize, Compose, GaussNoise)
+from albumentations import (
+    HorizontalFlip, IAAPerspective, ShiftScaleRotate, CLAHE, RandomRotate90,
+    Transpose, ShiftScaleRotate, Blur, OpticalDistortion, GridDistortion, HueSaturationValue,
+    IAAAdditiveGaussianNoise, GaussNoise, MotionBlur, MedianBlur, IAAPiecewiseAffine,ElasticTransform,RandomContrast,
+    IAASharpen, IAAEmboss, RandomBrightnessContrast, Flip, OneOf, Compose,Equalize,RandomGamma
+)
+from albumentations.pytorch.transforms import ToTensor
+# from albumentations.torch import ToTensor
+
+warnings.filterwarnings("ignore")
+
+import segmentation_models_pytorch as smp
+
+def run_length_decode(rle, height=1024, width=1024, fill_value=1):
+    component = np.zeros((height, width), np.float32)
+    component = component.reshape(-1)
+    # print(rle)
+    rle = np.array([int(s) for s in rle.strip().split(' ')])
+    #rle.shape:  466    (80,)
+    # print(rle.shape)
+    # print(rle)
+    rle = rle.reshape(-1, 2)
+    # print('gg')
+    start = 0
+    for index, length in rle:
+        start = start+index
+        end = start+length
+        component[start: end] = fill_value
+        start = end
+    component = component.reshape(width, height).T
+    return component
+
+def run_length_encode(component):
+    component = component.T.flatten()
+    start = np.where(component[1:] > component[:-1])[0]+1
+    end = np.where(component[:-1] > component[1:])[0]+1
+    length = end-start
+    rle = []
+    for i in range(len(length)):
+        if i == 0:
+            rle.extend([start[0], length[0]])
+        else:
+            rle.extend([start[i]-end[i-1], length[i]])
+    rle = ' '.join([str(r) for r in rle])
+    return rle
+
+
+class SIIMDataset(Dataset):
+    def __init__(self, df, fnames, data_folder, size, mean, std, phase):
+        self.df = df
+        self.root = data_folder
+        self.size = size
+        self.mean = mean
+        self.std = std
+        self.phase = phase
+        self.transforms = get_transforms(phase, size, mean, std)
+        self.gb = self.df.groupby('ImageId')
+        self.fnames = fnames
+
+    def __getitem__(self, idx):
+        image_id = self.fnames[idx]
+        df = self.gb.get_group(image_id)
+        annotations = df[' EncodedPixels'].tolist()
+        image_path = os.path.join(self.root, image_id + ".png")
+        image = cv2.imread(image_path)
+        mask = np.zeros([1024, 1024])
+        if annotations[0] != '-1':
+            for rle in annotations:
+                mask += run_length_decode(rle)
+        mask = (mask >= 1).astype('float32')  # for overlap cases
+        augmented = self.transforms(image=image, mask=mask)
+        image = augmented['image']
+        mask = augmented['mask']
+        return image, mask
+
+    def __len__(self):
+        return len(self.fnames)
+
+
+def get_transforms(phase, size, mean, std):
+    list_transforms = []
+    if phase == "train":
+        list_transforms.extend(
+            # [
+            #                     HorizontalFlip(),
+            #     ShiftScaleRotate(
+            #         shift_limit=0,  # no resizing
+            #         scale_limit=0.1,
+            #         rotate_limit=10,  # rotate
+            #         p=0.5,
+            #         border_mode=cv2.BORDER_CONSTANT
+            #     ),
+            #                     GaussNoise(),
+            # ]
+            [
+                RandomRotate90(),  # 将输入随机旋转90度，零次或多次
+                Flip(),  # 水平，垂直或水平和垂直翻转输入 d = 0表示垂直翻转，1表示水平翻转，垂直和水平翻转均为-1
+                Transpose(),  # 通过交换行和列来转置输入
+
+                ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5),
+                # 随机应用仿射变换：平移，缩放和旋转输入
+
+                # OneOf([
+                #     IAAAdditiveGaussianNoise(),
+                #     GaussNoise(),#将高斯噪声应用于输入图像
+                # ], p=0.2),
+
+                OneOf([
+                    MotionBlur(p=0.2),  # 使用随机大小的内核将运动模糊应用于输入图像
+                    MedianBlur(blur_limit=3, p=0.1),  # 使用具有随机孔径线性大小的中值滤波器来模糊输入图像
+                    Blur(blur_limit=3, p=0.1),  # 使用随机大小的内核模糊输入图像 blur_limit 用于模糊输入图像的最大内核大小 默认值：（3，7）
+                ], p=0.2),
+
+                OneOf([
+                    OpticalDistortion(p=0.3),  # 畸变(失真)矫正
+                    GridDistortion(p=0.1),
+                    IAAPiecewiseAffine(p=0.3),
+                    ElasticTransform(p=0.5),  # 图像的弹性变形
+                ], p=0.3),
+
+                OneOf([
+                    CLAHE(clip_limit=2),  # 将对比度受限的自适应直方图均衡应用于输入图像
+                    IAASharpen(),
+                    IAAEmboss(),
+                    RandomBrightnessContrast(),  # 随机更改输入图像的亮度和对比度
+                    RandomContrast(),  # 随机更改输入图像的对比度
+                ], p=0.3),
+
+                # HueSaturationValue(p=0.3),#随机更改输入图像的色相，饱和度和值
+                # Equalize(p=0.5),#均衡图像直方图
+            ]
+        )
+    list_transforms.extend(
+        [
+            Resize(size, size),
+            Normalize(mean=mean, std=std, p=1),
+            ToTensor(),
+        ]
+    )
+
+    list_trfms = Compose(list_transforms)
+    return list_trfms
+
+
+def provider(
+        fold,
+        total_folds,
+        data_folder,
+        df_path,
+        phase,
+        size,
+        mean=None,
+        std=None,
+        batch_size=2,
+        num_workers=4,
+):
+    df_all = pd.read_csv(df_path)
+    df = df_all.drop_duplicates('ImageId')
+    df_with_mask = df[df[" EncodedPixels"] != "-1"]
+    df_with_mask['has_mask'] = 1
+    df_without_mask = df[df[" EncodedPixels"] == "-1"]
+    df_without_mask['has_mask'] = 0
+    # print('df_with_mask')
+    # print(df_with_mask)
+    # print('df_without_mask')
+    # print(df_without_mask)
+
+    df_without_mask_sampled =df_without_mask.sample(len(df_with_mask.drop_duplicates('ImageId')))
+    # df_without_mask_sampled = df_without_mask.sample(len(df_with_mask), random_state=69)  # random state is imp
+    df = pd.concat([df_with_mask, df_without_mask_sampled])
+
+    # NOTE: equal number of positive and negative cases are chosen.
+
+    kfold = StratifiedKFold(total_folds, shuffle=True, random_state=69)
+    train_idx, val_idx = list(kfold.split(df["ImageId"], df["has_mask"]))[fold]
+    train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
+    df = train_df if phase == "train" else val_df
+    # NOTE: total_folds=5 -> train/val : 80%/20%
+
+    fnames = df['ImageId'].values
+
+    image_dataset = SIIMDataset(df_all, fnames, data_folder, size, mean, std, phase)
+
+    dataloader = DataLoader(
+        image_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        shuffle=True,
+    )
+    return dataloader
+
+# sample_submission_path = '../input/siim-acr-pneumothorax-segmentation/sample_submission.csv'
+sample_submission_path = './stage_2_sample_submission.csv'
+
+train_rle_path = './train-rle.csv'
+data_folder = "../siim_png_images/input/stage2_train_png"
+test_data_folder = "../siim_png_images/input/stage2_test_png"
+
+dataloader = provider(
+    fold=0,
+    total_folds=5,
+    data_folder=data_folder,
+    df_path=train_rle_path,
+    phase="train",
+    size=512,
+    mean = (0.485, 0.456, 0.406),
+    std = (0.229, 0.224, 0.225),
+    batch_size=2,
+    num_workers=4,
+)
+
+batch = next(iter(dataloader)) # get a batch from the dataloader
+images, masks = batch
+#########################################################################################
+# plot some random images in the `batch`
+# idx = random.choice(range(16))
+# plt.imshow(images[idx][0], cmap='bone')
+# plt.imshow(masks[idx][0], alpha=0.2, cmap='Reds')
+# plt.show()
+
+########################################################################################################
+# if len(np.unique(masks[idx][0])) == 1: # only zeros
+#     print('Chosen image has no ground truth mask, rerun the cell')
+
+def dice_loss(input, target):
+    input = torch.sigmoid(input)
+    smooth = 1.0
+    iflat = input.view(-1)
+    tflat = target.view(-1)
+    intersection = (iflat * tflat).sum()
+    return ((2.0 * intersection + smooth) / (iflat.sum() + tflat.sum() + smooth))
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, input, target):
+        if not (target.size() == input.size()):
+            raise ValueError("Target size ({}) must be the same as input size ({})"
+                             .format(target.size(), input.size()))
+        max_val = (-input).clamp(min=0)
+        loss = input - input * target + max_val + \
+            ((-max_val).exp() + (-input - max_val).exp()).log()
+        invprobs = F.logsigmoid(-input * (target * 2.0 - 1.0))
+        loss = (invprobs * self.gamma).exp() * loss
+        return loss.mean()
+
+
+class MixedLoss(nn.Module):
+    def __init__(self, alpha, gamma):
+        super().__init__()
+        self.alpha = alpha
+        self.focal = FocalLoss(gamma)
+
+    def forward(self, input, target):
+        loss = self.alpha*self.focal(input, target) - torch.log(dice_loss(input, target))
+        return loss.mean()
+
+def predict(X, threshold):
+    X_p = np.copy(X)
+    preds = (X_p > threshold).astype('uint8')
+    return preds
+
+def metric(probability, truth, threshold=0.5, reduction='none'):
+    '''Calculates dice of positive and negative images seperately'''
+    '''probability and truth must be torch tensors'''
+    batch_size = len(truth)
+    with torch.no_grad():
+        probability = probability.view(batch_size,-1)
+        truth = truth.view(batch_size,-1)
+        assert(probability.shape == truth.shape)
+
+        p = (probability > threshold).float()
+        t = (truth > 0.5).float()
+
+        t_sum = t.sum(-1)
+        p_sum = p.sum(-1)
+        neg_index = torch.nonzero(t_sum == 0)
+        pos_index = torch.nonzero(t_sum >= 1)
+
+        dice_neg = (p_sum == 0).float()
+        dice_pos = 2 * (p*t).sum(-1)/((p+t).sum(-1))
+
+        dice_neg = dice_neg[neg_index]
+        dice_pos = dice_pos[pos_index]
+        dice = torch.cat([dice_pos, dice_neg])
+
+#         dice_neg = np.nan_to_num(dice_neg.mean().item(), 0)
+#         dice_pos = np.nan_to_num(dice_pos.mean().item(), 0)
+#         dice = dice.mean().item()
+
+        num_neg = len(neg_index)
+        num_pos = len(pos_index)
+
+    return dice, dice_neg, dice_pos, num_neg, num_pos
+
+class Meter:
+    '''A meter to keep track of iou and dice scores throughout an epoch'''
+    def __init__(self, phase, epoch):
+        self.base_threshold = 0.5 # <<<<<<<<<<< here's the threshold
+        self.base_dice_scores = []
+        self.dice_neg_scores = []
+        self.dice_pos_scores = []
+        self.iou_scores = []
+
+    def update(self, targets, outputs):
+        probs = torch.sigmoid(outputs)
+        dice, dice_neg, dice_pos, _, _ = metric(probs, targets, self.base_threshold)
+        self.base_dice_scores.extend(dice)
+        self.dice_pos_scores.extend(dice_pos)
+        self.dice_neg_scores.extend(dice_neg)
+        preds = predict(probs, self.base_threshold)
+        iou = compute_iou_batch(preds, targets, classes=[1])
+        self.iou_scores.append(iou)
+
+    def get_metrics(self):
+        dice = np.nanmean(self.base_dice_scores)
+        dice_neg = np.nanmean(self.dice_neg_scores)
+        dice_pos = np.nanmean(self.dice_pos_scores)
+        dices = [dice, dice_neg, dice_pos]
+        iou = np.nanmean(self.iou_scores)
+        return dices, iou
+
+def epoch_log(phase, epoch, epoch_loss, meter, start):
+    '''logging the metrics at the end of an epoch'''
+    dices, iou = meter.get_metrics()
+    dice, dice_neg, dice_pos = dices
+    print("Loss: %0.4f | dice: %0.4f | dice_neg: %0.4f | dice_pos: %0.4f | IoU: %0.4f" % (epoch_loss, dice, dice_neg, dice_pos, iou))
+    return dice, iou
+
+def compute_ious(pred, label, classes, ignore_index=255, only_present=True):
+    '''computes iou for one ground truth mask and predicted mask'''
+    pred[label == ignore_index] = 0
+    ious = []
+    for c in classes:
+        label_c = label == c
+        if only_present and np.sum(label_c) == 0:
+            ious.append(np.nan)
+            continue
+        pred_c = pred == c
+        intersection = np.logical_and(pred_c, label_c).sum()
+        union = np.logical_or(pred_c, label_c).sum()
+        if union != 0:
+            ious.append(intersection / union)
+    return ious if ious else [1]
+
+
+def compute_iou_batch(outputs, labels, classes=None):
+    '''computes mean iou for a batch of ground truth masks and predicted masks'''
+    ious = []
+    preds = np.copy(outputs) # copy is imp
+    labels = np.array(labels) # tensor to np
+    for pred, label in zip(preds, labels):
+        ious.append(np.nanmean(compute_ious(pred, label, classes)))
+    iou = np.nanmean(ious)
+    return iou
+########################################################################################################################
+# import torch
+# import torch.nn as nn
+#
+#
+# class ConvSamePad2d(nn.Module):
+#     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, bias: bool = True):
+#         super().__init__()
+#
+#         left_top_pad = right_bottom_pad = kernel_size // 2
+#         if kernel_size % 2 == 0:
+#             right_bottom_pad -= 1
+#
+#         self.layer = nn.Sequential(
+#             nn.ReflectionPad2d((left_top_pad, right_bottom_pad, left_top_pad, right_bottom_pad)),
+#             nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias)
+#         )
+#
+#     def forward(self, inputs):
+#         return self.layer(inputs)
+#
+#
+# class Conv3x3(nn.Module):
+#     def __init__(self, in_channels, out_channels, drop_rate=0.5):
+#         super().__init__()
+#         self.layer = nn.Sequential(
+#             ConvSamePad2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3),
+#             nn.Dropout2d(p=drop_rate),
+#             ConvSamePad2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3),
+#             nn.Dropout2d(p=drop_rate)
+#         )
+#
+#     def forward(self, inputs):
+#         return self.layer(inputs)
+#
+#
+# class Conv1x1(nn.Module):
+#     def __init__(self, in_channels, out_channels):
+#         super().__init__()
+#
+#         self.layer = nn.Sequential(
+#             ConvSamePad2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1),
+#             nn.Sigmoid()
+#         )
+#
+#     def forward(self, inputs):
+#         return self.layer(inputs)
+#
+#
+# class Unet(nn.Module):
+#     def __init__(self, in_channels, n_classes, deep_supervision=True):
+#         super().__init__()
+#         self.deep_supervision = deep_supervision
+#
+#         filters = [32, 64, 128, 256, 512]
+#
+#         # j == 0
+#         self.x_00 = Conv3x3(in_channels=in_channels, out_channels=filters[0])
+#         self.pool0 = nn.MaxPool2d(kernel_size=2)
+#
+#         self.x_01 = Conv3x3(in_channels=filters[0] * 2, out_channels=filters[0])
+#         self.x_02 = Conv3x3(in_channels=filters[0] * 3, out_channels=filters[0])
+#         self.x_03 = Conv3x3(in_channels=filters[0] * 4, out_channels=filters[0])
+#         self.x_04 = Conv3x3(in_channels=filters[0] * 5, out_channels=filters[0])
+#
+#         self.up_10_to_01 = nn.ConvTranspose2d(in_channels=filters[1], out_channels=filters[0], kernel_size=2, stride=2)
+#         self.up_11_to_02 = nn.ConvTranspose2d(in_channels=filters[1], out_channels=filters[0], kernel_size=2, stride=2)
+#         self.up_12_to_03 = nn.ConvTranspose2d(in_channels=filters[1], out_channels=filters[0], kernel_size=2, stride=2)
+#         self.up_13_to_04 = nn.ConvTranspose2d(in_channels=filters[1], out_channels=filters[0], kernel_size=2, stride=2)
+#
+#         # j == 1
+#         self.x_10 = Conv3x3(in_channels=filters[0], out_channels=filters[1])
+#         self.pool1 = nn.MaxPool2d(kernel_size=2)
+#
+#         self.x_11 = Conv3x3(in_channels=filters[1] * 2, out_channels=filters[1])
+#         self.x_12 = Conv3x3(in_channels=filters[1] * 3, out_channels=filters[1])
+#         self.x_13 = Conv3x3(in_channels=filters[1] * 4, out_channels=filters[1])
+#
+#         self.up_20_to_11 = nn.ConvTranspose2d(in_channels=filters[2], out_channels=filters[1], kernel_size=2, stride=2)
+#         self.up_21_to_12 = nn.ConvTranspose2d(in_channels=filters[2], out_channels=filters[1], kernel_size=2, stride=2)
+#         self.up_22_to_13 = nn.ConvTranspose2d(in_channels=filters[2], out_channels=filters[1], kernel_size=2, stride=2)
+#
+#         # j == 2
+#         self.x_20 = Conv3x3(in_channels=filters[1], out_channels=filters[2])
+#         self.pool2 = nn.MaxPool2d(kernel_size=2)
+#
+#         self.x_21 = Conv3x3(in_channels=filters[2] * 2, out_channels=filters[2])
+#         self.x_22 = Conv3x3(in_channels=filters[2] * 3, out_channels=filters[2])
+#
+#         self.up_30_to_21 = nn.ConvTranspose2d(in_channels=filters[3], out_channels=filters[2], kernel_size=2, stride=2)
+#         self.up_31_to_22 = nn.ConvTranspose2d(in_channels=filters[3], out_channels=filters[2], kernel_size=2, stride=2)
+#
+#         # j == 3
+#         self.x_30 = Conv3x3(in_channels=filters[2], out_channels=filters[3])
+#         self.pool3 = nn.MaxPool2d(kernel_size=2)
+#
+#         self.x_31 = Conv3x3(in_channels=filters[3] * 2, out_channels=filters[3])
+#
+#         self.up_40_to_31 = nn.ConvTranspose2d(in_channels=filters[4], out_channels=filters[3], kernel_size=2, stride=2)
+#
+#         # j == 4
+#         self.x_40 = Conv3x3(in_channels=filters[3], out_channels=filters[4])
+#
+#         # 1x1 conv layer
+#         self.final_1x1_x01 = Conv1x1(in_channels=filters[0], out_channels=n_classes)
+#         self.final_1x1_x02 = Conv1x1(in_channels=filters[0], out_channels=n_classes)
+#         self.final_1x1_x03 = Conv1x1(in_channels=filters[0], out_channels=n_classes)
+#         self.final_1x1_x04 = Conv1x1(in_channels=filters[0], out_channels=n_classes)
+#
+#     def forward(self, inputs, L=4):
+#         if not (1 <= L <= 4):
+#             raise ValueError("the model pruning factor `L` should be 1 <= L <= 4")
+#
+#         x_00_output = self.x_00(inputs)
+#         x_10_output = self.x_10(self.pool0(x_00_output))
+#         x_10_up_sample = self.up_10_to_01(x_10_output)
+#         x_01_output = self.x_01(torch.cat([x_00_output, x_10_up_sample], 1))
+#         nestnet_output_1 = self.final_1x1_x01(x_01_output)
+#
+#         if L == 1:
+#             return nestnet_output_1
+#
+#         x_20_output = self.x_20(self.pool1(x_10_output))
+#         x_20_up_sample = self.up_20_to_11(x_20_output)
+#         x_11_output = self.x_11(torch.cat([x_10_output, x_20_up_sample], 1))
+#         x_11_up_sample = self.up_11_to_02(x_11_output)
+#         x_02_output = self.x_02(torch.cat([x_00_output, x_01_output, x_11_up_sample], 1))
+#         nestnet_output_2 = self.final_1x1_x01(x_02_output)
+#
+#         if L == 2:
+#             if self.deep_supervision:
+#                 # return the average of output layers
+#                 return (nestnet_output_1 + nestnet_output_2) / 2
+#             else:
+#                 return nestnet_output_2
+#
+#         x_30_output = self.x_30(self.pool2(x_20_output))
+#         x_30_up_sample = self.up_30_to_21(x_30_output)
+#         x_21_output = self.x_21(torch.cat([x_20_output, x_30_up_sample], 1))
+#         x_21_up_sample = self.up_21_to_12(x_21_output)
+#         x_12_output = self.x_12(torch.cat([x_10_output, x_11_output, x_21_up_sample], 1))
+#         x_12_up_sample = self.up_12_to_03(x_12_output)
+#         x_03_output = self.x_03(torch.cat([x_00_output, x_01_output, x_02_output, x_12_up_sample], 1))
+#         nestnet_output_3 = self.final_1x1_x01(x_03_output)
+#
+#         if L == 3:
+#             # return the average of output layers
+#             if self.deep_supervision:
+#                 return (nestnet_output_1 + nestnet_output_2 + nestnet_output_3) / 3
+#             else:
+#                 return nestnet_output_3
+#
+#         x_40_output = self.x_40(self.pool3(x_30_output))
+#         x_40_up_sample = self.up_40_to_31(x_40_output)
+#         x_31_output = self.x_31(torch.cat([x_30_output, x_40_up_sample], 1))
+#         x_31_up_sample = self.up_31_to_22(x_31_output)
+#         x_22_output = self.x_22(torch.cat([x_20_output, x_21_output, x_31_up_sample], 1))
+#         x_22_up_sample = self.up_22_to_13(x_22_output)
+#         x_13_output = self.x_13(torch.cat([x_10_output, x_11_output, x_12_output, x_22_up_sample], 1))
+#         x_13_up_sample = self.up_13_to_04(x_13_output)
+#         x_04_output = self.x_04(torch.cat([x_00_output, x_01_output, x_02_output, x_03_output, x_13_up_sample], 1))
+#         nestnet_output_4 = self.final_1x1_x01(x_04_output)
+#
+#         if L == 4:
+#             if self.deep_supervision:
+#                 # return the average of output layers
+#                 return (nestnet_output_1 + nestnet_output_2 + nestnet_output_3 + nestnet_output_4) / 4
+#             else:
+#                 return nestnet_output_4
+#
+# model = Unet(in_channels=3, n_classes=2).cuda()
+
+
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data
+import torch
+
+
+class conv_block(nn.Module):
+    """
+    Convolution Block
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super(conv_block, self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class up_conv(nn.Module):
+    """
+    Up Convolution Block
+    """
+
+    def __init__(self, in_ch, out_ch):
+        super(up_conv, self).__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+
+class U_Net(nn.Module):
+    """
+    UNet - Basic Implementation
+    Paper : https://arxiv.org/abs/1505.04597
+    """
+
+    def __init__(self, in_ch=3, out_ch=1):
+        super(U_Net, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.Conv1 = conv_block(in_ch, filters[0])
+        self.Conv2 = conv_block(filters[0], filters[1])
+        self.Conv3 = conv_block(filters[1], filters[2])
+        self.Conv4 = conv_block(filters[2], filters[3])
+        self.Conv5 = conv_block(filters[3], filters[4])
+
+        self.Up5 = up_conv(filters[4], filters[3])
+        self.Up_conv5 = conv_block(filters[4], filters[3])
+
+        self.Up4 = up_conv(filters[3], filters[2])
+        self.Up_conv4 = conv_block(filters[3], filters[2])
+
+        self.Up3 = up_conv(filters[2], filters[1])
+        self.Up_conv3 = conv_block(filters[2], filters[1])
+
+        self.Up2 = up_conv(filters[1], filters[0])
+        self.Up_conv2 = conv_block(filters[1], filters[0])
+
+        self.Conv = nn.Conv2d(filters[0], out_ch, kernel_size=1, stride=1, padding=0)
+
+    # self.active = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        e1 = self.Conv1(x)
+
+        e2 = self.Maxpool1(e1)
+        e2 = self.Conv2(e2)
+
+        e3 = self.Maxpool2(e2)
+        e3 = self.Conv3(e3)
+
+        e4 = self.Maxpool3(e3)
+        e4 = self.Conv4(e4)
+
+        e5 = self.Maxpool4(e4)
+        e5 = self.Conv5(e5)
+
+        d5 = self.Up5(e5)
+        d5 = torch.cat((e4, d5), dim=1)
+
+        d5 = self.Up_conv5(d5)
+
+        d4 = self.Up4(d5)
+        d4 = torch.cat((e3, d4), dim=1)
+        d4 = self.Up_conv4(d4)
+
+        d3 = self.Up3(d4)
+        d3 = torch.cat((e2, d3), dim=1)
+        d3 = self.Up_conv3(d3)
+
+        d2 = self.Up2(d3)
+        d2 = torch.cat((e1, d2), dim=1)
+        d2 = self.Up_conv2(d2)
+
+        out = self.Conv(d2)
+
+        # d1 = self.active(out)
+
+        return out
+
+
+class Recurrent_block(nn.Module):
+    """
+    Recurrent Block for R2Unet_CNN
+    """
+
+    def __init__(self, out_ch, t=2):
+        super(Recurrent_block, self).__init__()
+
+        self.t = t
+        self.out_ch = out_ch
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        for i in range(self.t):
+            if i == 0:
+                x = self.conv(x)
+            out = self.conv(x + x)
+        return out
+
+
+class RRCNN_block(nn.Module):
+    """
+    Recurrent Residual Convolutional Neural Network Block
+    """
+
+    def __init__(self, in_ch, out_ch, t=2):
+        super(RRCNN_block, self).__init__()
+
+        self.RCNN = nn.Sequential(
+            Recurrent_block(out_ch, t=t),
+            Recurrent_block(out_ch, t=t)
+        )
+        self.Conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        x1 = self.Conv(x)
+        x2 = self.RCNN(x1)
+        out = x1 + x2
+        return out
+
+
+class R2U_Net(nn.Module):
+    """
+    R2U-Unet implementation
+    Paper: https://arxiv.org/abs/1802.06955
+    """
+
+    def __init__(self, img_ch=3, output_ch=1, t=2):
+        super(R2U_Net, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.Maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.Upsample = nn.Upsample(scale_factor=2)
+
+        self.RRCNN1 = RRCNN_block(img_ch, filters[0], t=t)
+
+        self.RRCNN2 = RRCNN_block(filters[0], filters[1], t=t)
+
+        self.RRCNN3 = RRCNN_block(filters[1], filters[2], t=t)
+
+        self.RRCNN4 = RRCNN_block(filters[2], filters[3], t=t)
+
+        self.RRCNN5 = RRCNN_block(filters[3], filters[4], t=t)
+
+        self.Up5 = up_conv(filters[4], filters[3])
+        self.Up_RRCNN5 = RRCNN_block(filters[4], filters[3], t=t)
+
+        self.Up4 = up_conv(filters[3], filters[2])
+        self.Up_RRCNN4 = RRCNN_block(filters[3], filters[2], t=t)
+
+        self.Up3 = up_conv(filters[2], filters[1])
+        self.Up_RRCNN3 = RRCNN_block(filters[2], filters[1], t=t)
+
+        self.Up2 = up_conv(filters[1], filters[0])
+        self.Up_RRCNN2 = RRCNN_block(filters[1], filters[0], t=t)
+
+        self.Conv = nn.Conv2d(filters[0], output_ch, kernel_size=1, stride=1, padding=0)
+
+    # self.active = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        e1 = self.RRCNN1(x)
+
+        e2 = self.Maxpool(e1)
+        e2 = self.RRCNN2(e2)
+
+        e3 = self.Maxpool1(e2)
+        e3 = self.RRCNN3(e3)
+
+        e4 = self.Maxpool2(e3)
+        e4 = self.RRCNN4(e4)
+
+        e5 = self.Maxpool3(e4)
+        e5 = self.RRCNN5(e5)
+
+        d5 = self.Up5(e5)
+        d5 = torch.cat((e4, d5), dim=1)
+        d5 = self.Up_RRCNN5(d5)
+
+        d4 = self.Up4(d5)
+        d4 = torch.cat((e3, d4), dim=1)
+        d4 = self.Up_RRCNN4(d4)
+
+        d3 = self.Up3(d4)
+        d3 = torch.cat((e2, d3), dim=1)
+        d3 = self.Up_RRCNN3(d3)
+
+        d2 = self.Up2(d3)
+        d2 = torch.cat((e1, d2), dim=1)
+        d2 = self.Up_RRCNN2(d2)
+
+        out = self.Conv(d2)
+
+        # out = self.active(out)
+
+        return out
+
+
+class Attention_block(nn.Module):
+    """
+    Attention Block
+    """
+
+    def __init__(self, F_g, F_l, F_int):
+        super(Attention_block, self).__init__()
+
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        out = x * psi
+        return out
+
+
+class AttU_Net(nn.Module):
+    """
+    Attention Unet implementation
+    Paper: https://arxiv.org/abs/1804.03999
+    """
+
+    def __init__(self, img_ch=3, output_ch=1):
+        super(AttU_Net, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.Conv1 = conv_block(img_ch, filters[0])
+        self.Conv2 = conv_block(filters[0], filters[1])
+        self.Conv3 = conv_block(filters[1], filters[2])
+        self.Conv4 = conv_block(filters[2], filters[3])
+        self.Conv5 = conv_block(filters[3], filters[4])
+
+        self.Up5 = up_conv(filters[4], filters[3])
+        self.Att5 = Attention_block(F_g=filters[3], F_l=filters[3], F_int=filters[2])
+        self.Up_conv5 = conv_block(filters[4], filters[3])
+
+        self.Up4 = up_conv(filters[3], filters[2])
+        self.Att4 = Attention_block(F_g=filters[2], F_l=filters[2], F_int=filters[1])
+        self.Up_conv4 = conv_block(filters[3], filters[2])
+
+        self.Up3 = up_conv(filters[2], filters[1])
+        self.Att3 = Attention_block(F_g=filters[1], F_l=filters[1], F_int=filters[0])
+        self.Up_conv3 = conv_block(filters[2], filters[1])
+
+        self.Up2 = up_conv(filters[1], filters[0])
+        self.Att2 = Attention_block(F_g=filters[0], F_l=filters[0], F_int=32)
+        self.Up_conv2 = conv_block(filters[1], filters[0])
+
+        self.Conv = nn.Conv2d(filters[0], output_ch, kernel_size=1, stride=1, padding=0)
+
+        # self.active = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        e1 = self.Conv1(x)
+
+        e2 = self.Maxpool1(e1)
+        e2 = self.Conv2(e2)
+
+        e3 = self.Maxpool2(e2)
+        e3 = self.Conv3(e3)
+
+        e4 = self.Maxpool3(e3)
+        e4 = self.Conv4(e4)
+
+        e5 = self.Maxpool4(e4)
+        e5 = self.Conv5(e5)
+
+        # print(x5.shape)
+        d5 = self.Up5(e5)
+        # print(d5.shape)
+        x4 = self.Att5(g=d5, x=e4)
+        d5 = torch.cat((x4, d5), dim=1)
+        d5 = self.Up_conv5(d5)
+
+        d4 = self.Up4(d5)
+        x3 = self.Att4(g=d4, x=e3)
+        d4 = torch.cat((x3, d4), dim=1)
+        d4 = self.Up_conv4(d4)
+
+        d3 = self.Up3(d4)
+        x2 = self.Att3(g=d3, x=e2)
+        d3 = torch.cat((x2, d3), dim=1)
+        d3 = self.Up_conv3(d3)
+
+        d2 = self.Up2(d3)
+        x1 = self.Att2(g=d2, x=e1)
+        d2 = torch.cat((x1, d2), dim=1)
+        d2 = self.Up_conv2(d2)
+
+        out = self.Conv(d2)
+
+        #  out = self.active(out)
+
+        return out
+
+
+class R2AttU_Net(nn.Module):
+    """
+    Residual Recuurent Block with attention Unet
+    Implementation : https://github.com/LeeJunHyun/Image_Segmentation
+    """
+
+    def __init__(self, in_ch=3, out_ch=1, t=2):
+        super(R2AttU_Net, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.Maxpool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Maxpool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.RRCNN1 = RRCNN_block(in_ch, filters[0], t=t)
+        self.RRCNN2 = RRCNN_block(filters[0], filters[1], t=t)
+        self.RRCNN3 = RRCNN_block(filters[1], filters[2], t=t)
+        self.RRCNN4 = RRCNN_block(filters[2], filters[3], t=t)
+        self.RRCNN5 = RRCNN_block(filters[3], filters[4], t=t)
+
+        self.Up5 = up_conv(filters[4], filters[3])
+        self.Att5 = Attention_block(F_g=filters[3], F_l=filters[3], F_int=filters[2])
+        self.Up_RRCNN5 = RRCNN_block(filters[4], filters[3], t=t)
+
+        self.Up4 = up_conv(filters[3], filters[2])
+        self.Att4 = Attention_block(F_g=filters[2], F_l=filters[2], F_int=filters[1])
+        self.Up_RRCNN4 = RRCNN_block(filters[3], filters[2], t=t)
+
+        self.Up3 = up_conv(filters[2], filters[1])
+        self.Att3 = Attention_block(F_g=filters[1], F_l=filters[1], F_int=filters[0])
+        self.Up_RRCNN3 = RRCNN_block(filters[2], filters[1], t=t)
+
+        self.Up2 = up_conv(filters[1], filters[0])
+        self.Att2 = Attention_block(F_g=filters[0], F_l=filters[0], F_int=32)
+        self.Up_RRCNN2 = RRCNN_block(filters[1], filters[0], t=t)
+
+        self.Conv = nn.Conv2d(filters[0], out_ch, kernel_size=1, stride=1, padding=0)
+
+    # self.active = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        e1 = self.RRCNN1(x)
+
+        e2 = self.Maxpool1(e1)
+        e2 = self.RRCNN2(e2)
+
+        e3 = self.Maxpool2(e2)
+        e3 = self.RRCNN3(e3)
+
+        e4 = self.Maxpool3(e3)
+        e4 = self.RRCNN4(e4)
+
+        e5 = self.Maxpool4(e4)
+        e5 = self.RRCNN5(e5)
+
+        d5 = self.Up5(e5)
+        e4 = self.Att5(g=d5, x=e4)
+        d5 = torch.cat((e4, d5), dim=1)
+        d5 = self.Up_RRCNN5(d5)
+
+        d4 = self.Up4(d5)
+        e3 = self.Att4(g=d4, x=e3)
+        d4 = torch.cat((e3, d4), dim=1)
+        d4 = self.Up_RRCNN4(d4)
+
+        d3 = self.Up3(d4)
+        e2 = self.Att3(g=d3, x=e2)
+        d3 = torch.cat((e2, d3), dim=1)
+        d3 = self.Up_RRCNN3(d3)
+
+        d2 = self.Up2(d3)
+        e1 = self.Att2(g=d2, x=e1)
+        d2 = torch.cat((e1, d2), dim=1)
+        d2 = self.Up_RRCNN2(d2)
+
+        out = self.Conv(d2)
+
+        #  out = self.active(out)
+
+        return out
+
+
+# For nested 3 channels are required
+
+class conv_block_nested(nn.Module):
+
+    def __init__(self, in_ch, mid_ch, out_ch):
+        super(conv_block_nested, self).__init__()
+        self.activation = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=True)
+        self.bn1 = nn.BatchNorm2d(mid_ch)
+        self.conv2 = nn.Conv2d(mid_ch, out_ch, kernel_size=3, padding=1, bias=True)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.activation(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        output = self.activation(x)
+
+        return output
+
+
+# Nested Unet
+
+class NestedUNet(nn.Module):
+    """
+    Implementation of this paper:
+    https://arxiv.org/pdf/1807.10165.pdf
+    """
+
+    def __init__(self, in_ch=3, out_ch=1):
+        super(NestedUNet, self).__init__()
+
+        n1 = 64
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8, n1 * 16]
+
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.Up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+
+        self.conv0_0 = conv_block_nested(in_ch, filters[0], filters[0])
+        self.conv1_0 = conv_block_nested(filters[0], filters[1], filters[1])
+        self.conv2_0 = conv_block_nested(filters[1], filters[2], filters[2])
+        self.conv3_0 = conv_block_nested(filters[2], filters[3], filters[3])
+        self.conv4_0 = conv_block_nested(filters[3], filters[4], filters[4])
+
+        self.conv0_1 = conv_block_nested(filters[0] + filters[1], filters[0], filters[0])
+        self.conv1_1 = conv_block_nested(filters[1] + filters[2], filters[1], filters[1])
+        self.conv2_1 = conv_block_nested(filters[2] + filters[3], filters[2], filters[2])
+        self.conv3_1 = conv_block_nested(filters[3] + filters[4], filters[3], filters[3])
+
+        self.conv0_2 = conv_block_nested(filters[0] * 2 + filters[1], filters[0], filters[0])
+        self.conv1_2 = conv_block_nested(filters[1] * 2 + filters[2], filters[1], filters[1])
+        self.conv2_2 = conv_block_nested(filters[2] * 2 + filters[3], filters[2], filters[2])
+
+        self.conv0_3 = conv_block_nested(filters[0] * 3 + filters[1], filters[0], filters[0])
+        self.conv1_3 = conv_block_nested(filters[1] * 3 + filters[2], filters[1], filters[1])
+
+        self.conv0_4 = conv_block_nested(filters[0] * 4 + filters[1], filters[0], filters[0])
+
+        self.final = nn.Conv2d(filters[0], out_ch, kernel_size=1)
+
+    def forward(self, x):
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.pool(x0_0))
+        x0_1 = self.conv0_1(torch.cat([x0_0, self.Up(x1_0)], 1))
+
+        x2_0 = self.conv2_0(self.pool(x1_0))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self.Up(x2_0)], 1))
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.Up(x1_1)], 1))
+
+        x3_0 = self.conv3_0(self.pool(x2_0))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self.Up(x3_0)], 1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.Up(x2_1)], 1))
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.Up(x1_2)], 1))
+
+        x4_0 = self.conv4_0(self.pool(x3_0))
+        x3_1 = self.conv3_1(torch.cat([x3_0, self.Up(x4_0)], 1))
+        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.Up(x3_1)], 1))
+        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.Up(x2_2)], 1))
+        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.Up(x1_3)], 1))
+
+        output = self.final(x0_4)
+        return output
+
+
+# Dictioary Unet
+# if required for getting the filters and model parameters for each step
+
+class ConvolutionBlock(nn.Module):
+    """Convolution block"""
+
+    def __init__(self, in_filters, out_filters, kernel_size=3, batchnorm=True, last_active=F.relu):
+        super(ConvolutionBlock, self).__init__()
+
+        self.bn = batchnorm
+        self.last_active = last_active
+        self.c1 = nn.Conv2d(in_filters, out_filters, kernel_size, padding=1)
+        self.b1 = nn.BatchNorm2d(out_filters)
+        self.c2 = nn.Conv2d(out_filters, out_filters, kernel_size, padding=1)
+        self.b2 = nn.BatchNorm2d(out_filters)
+
+    def forward(self, x):
+        x = self.c1(x)
+        if self.bn:
+            x = self.b1(x)
+        x = F.relu(x)
+        x = self.c2(x)
+        if self.bn:
+            x = self.b2(x)
+        x = self.last_active(x)
+        return x
+
+
+class ContractiveBlock(nn.Module):
+    """Deconvuling Block"""
+
+    def __init__(self, in_filters, out_filters, conv_kern=3, pool_kern=2, dropout=0.5, batchnorm=True):
+        super(ContractiveBlock, self).__init__()
+        self.c1 = ConvolutionBlock(in_filters=in_filters, out_filters=out_filters, kernel_size=conv_kern,
+                                   batchnorm=batchnorm)
+        self.p1 = nn.MaxPool2d(kernel_size=pool_kern, ceil_mode=True)
+        self.d1 = nn.Dropout2d(dropout)
+
+    def forward(self, x):
+        c = self.c1(x)
+        return c, self.d1(self.p1(c))
+
+
+class ExpansiveBlock(nn.Module):
+    """Upconvole Block"""
+
+    def __init__(self, in_filters1, in_filters2, out_filters, tr_kern=3, conv_kern=3, stride=2, dropout=0.5):
+        super(ExpansiveBlock, self).__init__()
+        self.t1 = nn.ConvTranspose2d(in_filters1, out_filters, tr_kern, stride=2, padding=1, output_padding=1)
+        self.d1 = nn.Dropout(dropout)
+        self.c1 = ConvolutionBlock(out_filters + in_filters2, out_filters, conv_kern)
+
+    def forward(self, x, contractive_x):
+        x_ups = self.t1(x)
+        x_concat = torch.cat([x_ups, contractive_x], 1)
+        x_fin = self.c1(self.d1(x_concat))
+        return x_fin
+
+
+class Unet_dict(nn.Module):
+    """Unet which operates with filters dictionary values"""
+
+    def __init__(self, n_labels, n_filters=32, p_dropout=0.5, batchnorm=True):
+        super(Unet_dict, self).__init__()
+        filters_dict = {}
+        filt_pair = [3, n_filters]
+
+        for i in range(4):
+            self.add_module('contractive_' + str(i), ContractiveBlock(filt_pair[0], filt_pair[1], batchnorm=batchnorm))
+            filters_dict['contractive_' + str(i)] = (filt_pair[0], filt_pair[1])
+            filt_pair[0] = filt_pair[1]
+            filt_pair[1] = filt_pair[1] * 2
+
+        self.bottleneck = ConvolutionBlock(filt_pair[0], filt_pair[1], batchnorm=batchnorm)
+        filters_dict['bottleneck'] = (filt_pair[0], filt_pair[1])
+
+        for i in reversed(range(4)):
+            self.add_module('expansive_' + str(i),
+                            ExpansiveBlock(filt_pair[1], filters_dict['contractive_' + str(i)][1], filt_pair[0]))
+            filters_dict['expansive_' + str(i)] = (filt_pair[1], filt_pair[0])
+            filt_pair[1] = filt_pair[0]
+            filt_pair[0] = filt_pair[0] // 2
+
+        self.output = nn.Conv2d(filt_pair[1], n_labels, kernel_size=1)
+        filters_dict['output'] = (filt_pair[1], n_labels)
+        self.filters_dict = filters_dict
+
+    # final_forward
+    def forward(self, x):
+        c00, c0 = self.contractive_0(x)
+        c11, c1 = self.contractive_1(c0)
+        c22, c2 = self.contractive_2(c1)
+        c33, c3 = self.contractive_3(c2)
+        bottle = self.bottleneck(c3)
+        u3 = F.relu(self.expansive_3(bottle, c33))
+        u2 = F.relu(self.expansive_2(u3, c22))
+        u1 = F.relu(self.expansive_1(u2, c11))
+        u0 = F.relu(self.expansive_0(u1, c00))
+        return F.softmax(self.output(u0), dim=1)
+
+
+
+# model = NestedUNet()
+
+model = AttU_Net()
+
+# model = R2AttU_Net()
+
+# model = U_Net()
+
+
+
+
+# model = smp.Unet("efficientnet-b4", encoder_weights="imagenet", activation=None)
+
+##############################################################################################################################
+# state = torch.load('./768effib4unet100.pth', map_location=lambda storage, loc: storage)
+# model.load_state_dict(state["state_dict"])
+model =torch.nn.DataParallel(model).cuda()
+cudnn.benchmark =True
+
+import math
+import torch
+from torch.optim.optimizer import Optimizer, required
+
+class RAdam(Optimizer):
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.buffer = [[None, None, None] for ind in range(10)]
+        super(RAdam, self).__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super(RAdam, self).__setstate__(state)
+
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data.float()
+                if grad.is_sparse:
+                    raise RuntimeError('RAdam does not support sparse gradients')
+
+                p_data_fp32 = p.data.float()
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p_data_fp32)
+                    state['exp_avg_sq'] = torch.zeros_like(p_data_fp32)
+                else:
+                    state['exp_avg'] = state['exp_avg'].type_as(p_data_fp32)
+                    state['exp_avg_sq'] = state['exp_avg_sq'].type_as(p_data_fp32)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+
+                state['step'] += 1
+                buffered = self.buffer[int(state['step'] % 10)]
+                if state['step'] == buffered[0]:
+                    N_sma, step_size = buffered[1], buffered[2]
+                else:
+                    buffered[0] = state['step']
+                    beta2_t = beta2 ** state['step']
+                    N_sma_max = 2 / (1 - beta2) - 1
+                    N_sma = N_sma_max - 2 * state['step'] * beta2_t / (1 - beta2_t)
+                    buffered[1] = N_sma
+
+                    # more conservative since it's an approximated value
+                    if N_sma >= 5:
+                        step_size = group['lr'] * math.sqrt((1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) * (N_sma - 2) / N_sma * N_sma_max / (N_sma_max - 2)) / (1 - beta1 ** state['step'])
+                    else:
+                        step_size = group['lr'] / (1 - beta1 ** state['step'])
+                    buffered[2] = step_size
+
+                if group['weight_decay'] != 0:
+                    p_data_fp32.add_(-group['weight_decay'] * group['lr'], p_data_fp32)
+
+                # more conservative since it's an approximated value
+                if N_sma >= 5:
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
+                    p_data_fp32.addcdiv_(-step_size, exp_avg, denom)
+                else:
+                    p_data_fp32.add_(-step_size, exp_avg)
+
+                p.data.copy_(p_data_fp32)
+
+        return loss
+
+class Trainer(object):
+    '''This class takes care of training and validation of our model'''
+
+    def __init__(self, model):
+        self.fold = 1
+        self.total_folds = 5
+        self.num_workers = 0
+        self.batch_size = {"train": 4, "val": 4}
+        self.accumulation_steps = 32 // self.batch_size['train']
+        self.lr = 3e-4
+        #######################################################################################################################
+        self.num_epochs = 100
+        self.best_loss = float("inf")
+        self.phases = ["train", "val"]
+        self.device = torch.device("cuda:0")
+        torch.set_default_tensor_type("torch.cuda.FloatTensor")
+        self.net = model
+        self.criterion = MixedLoss(10.0, 2.0)
+
+        # self.optimizer = optim.SGD(self.net.parameters(), lr=self.lr)
+        # self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2, eta_min=0)
+
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode="min", patience=3, verbose=True)
+
+        # self.optimizer = RAdam(model.parameters(), lr=self.lr)
+        # #    Radam or adam
+        # self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
+        # 自适应调整学习率
+        # self.scheduler = ReduceLROnPlateau(self.optimizer, mode="min", patience=3, verbose=True)
+
+
+        self.net = self.net.to(self.device)
+        cudnn.benchmark = True
+        self.dataloaders = {
+            phase: provider(
+                fold=1,
+                total_folds=5,
+                data_folder=data_folder,
+                df_path=train_rle_path,
+                phase=phase,
+                size=512,
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
+                batch_size=self.batch_size[phase],
+                num_workers=self.num_workers,
+            )
+            for phase in self.phases
+        }
+        self.losses = {phase: [] for phase in self.phases}
+        self.iou_scores = {phase: [] for phase in self.phases}
+        self.dice_scores = {phase: [] for phase in self.phases}
+
+    def forward(self, images, targets):
+        images = images.to(self.device)
+        masks = targets.to(self.device)
+        outputs = self.net(images)
+        loss = self.criterion(outputs, masks)
+        return loss, outputs
+
+    def iterate(self, epoch, phase):
+        meter = Meter(phase, epoch)
+        start = time.strftime("%H:%M:%S")
+        print(f"Starting epoch: {epoch} | phase: {phase} | ⏰: {start}")
+        batch_size = self.batch_size[phase]
+        self.net.train(phase == "train")
+        dataloader = self.dataloaders[phase]
+        running_loss = 0.0
+        total_batches = len(dataloader)
+        #         tk0 = tqdm(dataloader, total=total_batches)
+        self.optimizer.zero_grad()
+        for itr, batch in enumerate(dataloader):
+            images, targets = batch
+            loss, outputs = self.forward(images, targets)
+            loss = loss / self.accumulation_steps
+            if phase == "train":
+                loss.backward()
+                if (itr + 1) % self.accumulation_steps == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+            running_loss += loss.item()
+            outputs = outputs.detach().cpu()
+            meter.update(targets, outputs)
+        #             tk0.set_postfix(loss=(running_loss / ((itr + 1))))
+        epoch_loss = (running_loss * self.accumulation_steps) / total_batches
+        dice, iou = epoch_log(phase, epoch, epoch_loss, meter, start)
+        self.losses[phase].append(epoch_loss)
+        self.dice_scores[phase].append(dice)
+        self.iou_scores[phase].append(iou)
+        torch.cuda.empty_cache()
+        return epoch_loss
+
+    def start(self):
+        for epoch in range(self.num_epochs):
+            self.iterate(epoch, "train")
+            state = {
+                "epoch": epoch,
+                "best_loss": self.best_loss,
+                "state_dict": self.net.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+            }
+            val_loss = self.iterate(epoch, "val")
+            self.scheduler.step(val_loss)
+            if val_loss < self.best_loss:
+                print("******** New optimal found, saving state ********")
+                state["best_loss"] = self.best_loss = val_loss
+                ###############################################################################################################
+                torch.save(state, "./512unet++100.pth")
+            print()
+
+
+
+
+model_trainer = Trainer(model)
+model_trainer.start()
+
+# PLOT TRAINING
+losses = model_trainer.losses
+dice_scores = model_trainer.dice_scores # overall dice
+iou_scores = model_trainer.iou_scores
+
+def plot(scores, name):
+    plt.figure(figsize=(15,5))
+    plt.plot(range(len(scores["train"])), scores["train"], label=f'train {name}')
+    plt.plot(range(len(scores["train"])), scores["val"], label=f'val {name}')
+    plt.title(f'{name} plot'); plt.xlabel('Epoch'); plt.ylabel(f'{name}')
+    plt.legend()
+    #
+    plt.savefig(name)
+
+plot(losses, "512unet++BCE loss.png")
+plot(dice_scores, "512unet++Dice score.png")
+plot(iou_scores, "512unet++IoU score.png")
+
+class TestDataset(Dataset):
+    def __init__(self, root, df, size, mean, std, tta=4):
+        self.root = root
+        self.size = size
+        self.fnames = list(df["ImageId"])
+        self.num_samples = len(self.fnames)
+        self.transform = Compose(
+            [
+                Normalize(mean=mean, std=std, p=1),
+                Resize(size, size),
+                ToTensor(),
+            ]
+        )
+
+    def __getitem__(self, idx):
+        fname = self.fnames[idx]
+        path = os.path.join(self.root, fname + ".png")
+        image = cv2.imread(path)
+        images = self.transform(image=image)["image"]
+        return images
+
+    def __len__(self):
+        return self.num_samples
+
+def post_process(probability, threshold, min_size):
+    mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
+    num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
+    predictions = np.zeros((1024, 1024), np.float32)
+    num = 0
+    for c in range(1, num_component):
+        p = (component == c)
+        if p.sum() > min_size:
+            predictions[p] = 1
+            num += 1
+    return predictions, num
+
+
+size = 512
+mean = (0.485, 0.456, 0.406)
+std = (0.229, 0.224, 0.225)
+num_workers = 4
+#################################################################################################################
+batch_size = 2
+best_threshold = 0.5
+min_size = 3500
+device = torch.device("cuda:0")
+df = pd.read_csv(sample_submission_path)
+testset = DataLoader(
+    TestDataset(test_data_folder, df, size, mean, std),
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=num_workers,
+    pin_memory=True,
+)
+model = model_trainer.net # get the model from model_trainer object
+model.eval()
+
+######################################################################################################33
+state = torch.load('./512unet++100.pth', map_location=lambda storage, loc: storage)
+model.load_state_dict(state["state_dict"])
+encoded_pixels = []
+for i, batch in enumerate(tqdm(testset)):
+    preds = torch.sigmoid(model(batch.to(device)))
+    preds = preds.detach().cpu().numpy()[:, 0, :, :] # (batch_size, 1, size, size) -> (batch_size, size, size)
+    for probability in preds:
+        if probability.shape != (1024, 1024):
+            probability = cv2.resize(probability, dsize=(1024, 1024), interpolation=cv2.INTER_LINEAR)
+        predict, num_predict = post_process(probability, best_threshold, min_size)
+        if num_predict == 0:
+            encoded_pixels.append('-1')
+        else:
+            r = run_length_encode(predict)
+            encoded_pixels.append(r)
+df['EncodedPixels'] = encoded_pixels
+###########################################################################################################################################
+df.to_csv('512unet++100.csv', columns=['ImageId', 'EncodedPixels'], index=False)
+
